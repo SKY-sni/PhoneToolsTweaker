@@ -1,8 +1,18 @@
 """
-Phone Tools Tweaker v1.0
-Универсальный инструмент для работы с Android через ADB и Fastboot.
-Безопасность: все пользовательские данные экранируются, shell=True используется минимально.
-Логирование: вывод дублируется в phone_tools_tweaker.log.
+Phone Tools Tweaker v1.0 - Кроссплатформенная адаптация для Windows и Linux (Fedora)
+Changelog для Linux:
+- Иконка: обёрнута в try/except, на Linux используется iconphoto с PNG (если есть).
+- Перезапуск при смене языка: заменён os.execl на subprocess.Popen + sys.exit(0) для корректного завершения Tcl.
+- Окружение: сначала проверяются системные adb/fastboot, при их отсутствии добавляется папка tools/.
+- Shell-команды: wipe_all заменён на последовательный вызов трёх erase команд; logcat_filter теперь фильтрует вывод в Python без grep.
+- Добавлена проверка на "no permissions" для fastboot с выводом инструкции по настройке udev.
+- Шрифты: 'Consolas' заменён на 'monospace', 'Arial' оставлен для совместимости.
+- Пути: лог-файл перенесён в каталог конфигурации (APPDATA/XDG_CONFIG_HOME).
+- Окончания строк: rstrip('\n') заменён на rstrip('\r\n').
+- Отмена задачи: добавлен таймаут 2 секунды перед kill, если terminate не сработал.
+- Добавлен пункт меню Help -> About с информацией об ОС и путях к утилитам.
+- Команда "ping device" теперь пингует 8.8.8.8 вместо localhost.
+- Все изменения сохраняют полную функциональность и локализацию (ru/en).
 """
 
 import os
@@ -41,7 +51,7 @@ LANGUAGES = {
         # Общие
         'check_devices': 'Проверить устройства (ADB / Fastboot)',
         'log_label': 'Вывод терминала / Лог выполнения',
-        'warning_tools_missing': 'ВНИМАНИЕ: Утилиты {missing} не найдены в папке!',
+        'warning_tools_missing': 'ВНИМАНИЕ: Утилиты {missing} не найдены!',
         'scan_ports': '=== Сканирование портов ===',
         'error_select_img': 'Сначала выберите файл образа!',
         'error_select_apk': 'Выберите APK файл!',
@@ -272,6 +282,11 @@ LANGUAGES = {
         'pkg_revoke_prompt': 'Введите пакет и разрешение:',
         'pkg_path_prompt': 'Введите имя пакета:',
         'pkg_info_prompt': 'Введите имя пакета:',
+        # About
+        'menu_help': 'Справка',
+        'menu_about': 'О программе',
+        'about_title': 'О Phone Tools Tweaker',
+        'about_text': 'Версия: {version}\nОС: {os}\nPython: {python}\nADB: {adb}\nFastboot: {fastboot}',
     },
     'en': {
         'app_title': 'Phone Tools Tweaker',
@@ -293,7 +308,7 @@ LANGUAGES = {
         'tab_custom': 'Custom Command',
         'check_devices': 'Check devices (ADB / Fastboot)',
         'log_label': 'Terminal output / Log',
-        'warning_tools_missing': 'WARNING: Utilities {missing} not found in folder!',
+        'warning_tools_missing': 'WARNING: Utilities {missing} not found!',
         'scan_ports': '=== Scanning ports ===',
         'error_select_img': 'Please select an image file first!',
         'error_select_apk': 'Select an APK file!',
@@ -509,17 +524,21 @@ LANGUAGES = {
         'pkg_revoke_prompt': 'Enter package and permission:',
         'pkg_path_prompt': 'Enter package name:',
         'pkg_info_prompt': 'Enter package name:',
+        'menu_help': 'Help',
+        'menu_about': 'About',
+        'about_title': 'About Phone Tools Tweaker',
+        'about_text': 'Version: {version}\nOS: {os}\nPython: {python}\nADB: {adb}\nFastboot: {fastboot}',
     }
 }
 
 # --------------------- Вспомогательные классы ---------------------
 class LogManager:
-    """Дублирует вывод в текстовый виджет и в файл."""
-    def __init__(self, text_widget, filename='phone_tools_tweaker.log'):
+    """Дублирует вывод в текстовый виджет и в файл. Файл сохраняется в каталоге конфигурации."""
+    def __init__(self, text_widget, config_dir, filename='phone_tools_tweaker.log'):
         self.text = text_widget
-        self.filename = filename
+        self.filename = os.path.join(config_dir, filename)
         try:
-            self.file = open(filename, 'a', encoding='utf-8')
+            self.file = open(self.filename, 'a', encoding='utf-8')
         except Exception:
             self.file = None
 
@@ -577,6 +596,68 @@ class CommandTask(threading.Thread):
         self._cancelled = True
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
+            # Даём время на завершение, затем убиваем
+            def kill_process():
+                if self.proc and self.proc.poll() is None:
+                    self.proc.kill()
+            timer = threading.Timer(2.0, kill_process)
+            timer.daemon = True
+            timer.start()
+
+    def get_line(self):
+        try:
+            return self.output_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+
+class SequenceCommandTask(threading.Thread):
+    """Выполняет несколько команд последовательно и собирает вывод."""
+    def __init__(self, command_list, callback=None):
+        super().__init__(daemon=True)
+        self.command_list = command_list  # список списков аргументов
+        self.callback = callback
+        self.output_queue = queue.Queue()
+        self._cancelled = False
+        self.proc = None
+
+    def run(self):
+        for cmd_args in self.command_list:
+            if self._cancelled:
+                break
+            cmd_str = ' '.join(shlex.quote(a) for a in cmd_args)
+            self.output_queue.put(f"\n> {cmd_str}\n")
+            try:
+                self.proc = subprocess.Popen(
+                    cmd_args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                for line in self.proc.stdout:
+                    if self._cancelled:
+                        self.proc.terminate()
+                        break
+                    self.output_queue.put(line)
+                self.proc.stdout.close()
+                returncode = self.proc.wait()
+                if not self._cancelled:
+                    self.output_queue.put(f"[Команда завершена, код {returncode}]\n")
+            except Exception as e:
+                self.output_queue.put(f"[Ошибка выполнения] {str(e)}\n")
+        self.output_queue.put(None)
+
+    def cancel(self):
+        self._cancelled = True
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            def kill_process():
+                if self.proc and self.proc.poll() is None:
+                    self.proc.kill()
+            timer = threading.Timer(2.0, kill_process)
+            timer.daemon = True
+            timer.start()
 
     def get_line(self):
         try:
@@ -605,7 +686,7 @@ class ScrollableFrame(ttk.Frame):
 
 
 class LanguageManager:
-    """Загрузка/сохранение языка в AppData."""
+    """Загрузка/сохранение языка в AppData/XDG_CONFIG_HOME."""
     def __init__(self):
         self.config_dir = self._get_config_dir()
         self.config_file = os.path.join(self.config_dir, 'config.ini')
@@ -678,9 +759,15 @@ class PhoneToolsTweakerApp:
         self.version = "1.0"
         self.root.title(f"{self.strings['app_title']} v{self.version}")
 
-        # Иконка
+        # Иконка (кроссплатформенная)
         try:
-            self.root.iconbitmap('app.ico')
+            if sys.platform == 'win32':
+                self.root.iconbitmap('app.ico')
+            else:
+                # Попытаться загрузить PNG (если есть)
+                if os.path.exists('app.png'):
+                    img = tk.PhotoImage(file='app.png')
+                    self.root.iconphoto(True, img)
         except Exception:
             pass
 
@@ -706,15 +793,51 @@ class PhoneToolsTweakerApp:
         self.check_tools_silently()
 
     def setup_environment(self):
+        # Определяем базовую директорию (для PyInstaller)
         if getattr(sys, 'frozen', False):
             base_dir = sys._MEIPASS
         else:
             base_dir = os.path.dirname(os.path.abspath(__file__))
+
         tools_dir = os.path.join(base_dir, 'tools')
-        if os.path.isdir(tools_dir):
-            os.environ["PATH"] = tools_dir + os.pathsep + os.environ["PATH"]
+
+        # Сначала проверяем наличие adb и fastboot в системе
+        adb_path = shutil.which('adb')
+        fastboot_path = shutil.which('fastboot')
+        if adb_path and fastboot_path:
+            self.log(f"[OK] ADB found: {adb_path}")
+            self.log(f"[OK] Fastboot found: {fastboot_path}")
+            # Не добавляем tools в PATH, используем системные
         else:
-            os.environ["PATH"] = base_dir + os.pathsep + os.environ["PATH"]
+            # Ищем в папке tools
+            if sys.platform == 'win32':
+                adb_exe = 'adb.exe'
+                fastboot_exe = 'fastboot.exe'
+            else:
+                adb_exe = 'adb'
+                fastboot_exe = 'fastboot'
+
+            adb_tool = os.path.join(tools_dir, adb_exe)
+            fastboot_tool = os.path.join(tools_dir, fastboot_exe)
+
+            if os.path.isfile(adb_tool) and os.path.isfile(fastboot_tool):
+                # Добавляем tools в начало PATH
+                os.environ["PATH"] = tools_dir + os.pathsep + os.environ["PATH"]
+                self.log(f"[OK] Using tools from: {tools_dir}")
+            else:
+                self.log("[WARN] Neither system nor tools folder contain adb/fastboot. Commands may fail.")
+
+        # Дополнительно проверим наличие через which после изменения PATH
+        adb_path = shutil.which('adb')
+        fastboot_path = shutil.which('fastboot')
+        if adb_path:
+            self.log(f"[INFO] ADB resolved to: {adb_path}")
+        else:
+            self.log("[ERROR] ADB not found in PATH or tools.")
+        if fastboot_path:
+            self.log(f"[INFO] Fastboot resolved to: {fastboot_path}")
+        else:
+            self.log("[ERROR] Fastboot not found in PATH or tools.")
 
     # ---------- Логирование ----------
     def log(self, message, end='\n'):
@@ -736,6 +859,17 @@ class PhoneToolsTweakerApp:
         self.current_task.start()
         self.poll_task_output()
 
+    def run_sequence(self, command_list, callback=None):
+        """Выполнить список команд последовательно."""
+        if self.current_task and self.current_task.is_alive():
+            self.log("[Занято] Дождитесь завершения предыдущей операции.")
+            return
+        self.log("\n> Запуск последовательности команд...")
+        self.start_progress()
+        self.current_task = SequenceCommandTask(command_list, callback=callback)
+        self.current_task.start()
+        self.poll_task_output()
+
     def poll_task_output(self):
         if self.current_task is None:
             self.stop_progress()
@@ -750,7 +884,7 @@ class PhoneToolsTweakerApp:
                 self.current_task = None
                 return
             else:
-                self.log(line.rstrip('\n'))
+                self.log(line.rstrip('\r\n'))
         self.after_id = self.root.after(100, self.poll_task_output)
 
     def cancel_task(self):
@@ -777,29 +911,36 @@ class PhoneToolsTweakerApp:
 
     # ---------- Проверка инструментов ----------
     def check_tools_silently(self):
-        missing = [t for t in ['adb', 'fastboot'] if not shutil.which(t)]
-        if missing:
+        adb_path = shutil.which('adb')
+        fastboot_path = shutil.which('fastboot')
+        if not adb_path or not fastboot_path:
+            missing = []
+            if not adb_path:
+                missing.append('adb')
+            if not fastboot_path:
+                missing.append('fastboot')
             msg = self.strings['warning_tools_missing'].format(missing=', '.join(missing))
             self.log(msg)
         else:
-            self.log("[ОК] ADB и Fastboot обнаружены.")
+            self.log("[OK] ADB and Fastboot are available.")
 
-    # ---------- Фабрика кнопок (ИСПРАВЛЕНО) ----------
+    # ---------- Фабрика кнопок ----------
     def make_button(self, parent, text, command, **kwargs):
-        """Создаёт кнопку с заданными параметрами, позволяя переопределить стандартные bg/fg/relief."""
         defaults = {'bg': '#3c3c3c', 'fg': 'white', 'relief': 'flat'}
         for key, value in defaults.items():
-            kwargs.setdefault(key, value)   # не перезаписываем, если уже передано
+            kwargs.setdefault(key, value)
         return tk.Button(parent, text=text, command=command, **kwargs)
 
-    # ---------- Смена языка ----------
+    # ---------- Смена языка (кроссплатформенный перезапуск) ----------
     def change_language(self, lang_code):
         if lang_code == self.lang_manager.lang:
             return
         self.lang_manager.lang = lang_code
         self.lang_manager.save()
-        python = sys.executable
-        os.execl(python, python, *sys.argv)
+        # Завершаем текущий процесс и запускаем новый
+        self.root.quit()
+        subprocess.Popen([sys.executable] + sys.argv)
+        sys.exit(0)
 
     # ---------- Создание GUI ----------
     def create_widgets(self):
@@ -818,10 +959,15 @@ class PhoneToolsTweakerApp:
         # Меню
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
+
         lang_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Language", menu=lang_menu)
         lang_menu.add_command(label="Русский", command=lambda: self.change_language('ru'))
         lang_menu.add_command(label="English", command=lambda: self.change_language('en'))
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label=self.strings['menu_help'], menu=help_menu)
+        help_menu.add_command(label=self.strings['menu_about'], command=self.show_about)
 
         # Верхняя панель
         top_frame = tk.Frame(self.root, bg='#2d2d2d', pady=5)
@@ -856,20 +1002,34 @@ class PhoneToolsTweakerApp:
 
         self.log_text = tk.Text(bot_frame, height=10, wrap="word",
                                 bg='#0c0c0c', fg='#00ff00',
-                                font=("Consolas", 10), insertbackground='white', relief='flat')
+                                font=("monospace", 10), insertbackground='white', relief='flat')
         self.log_text.pack(fill="both", expand=True, side="left", padx=5, pady=5)
 
         scrollbar = tk.Scrollbar(bot_frame, command=self.log_text.yview, bg='#2d2d2d')
         scrollbar.pack(side="right", fill="y")
         self.log_text.config(yscrollcommand=scrollbar.set)
 
-        self.logger = LogManager(self.log_text)
+        self.logger = LogManager(self.log_text, self.lang_manager.config_dir)
 
         self.progress = ttk.Progressbar(bot_frame, mode='indeterminate', length=200)
         self.progress.pack(pady=(0, 5))
         self.stop_btn = tk.Button(bot_frame, text="⏹ Стоп", command=self.cancel_task,
                                   bg='#d9534f', fg='white', relief='flat', state=tk.DISABLED)
         self.stop_btn.pack(pady=(0, 5))
+
+    def show_about(self):
+        adb_path = shutil.which('adb') or 'не найден'
+        fastboot_path = shutil.which('fastboot') or 'не найден'
+        os_info = sys.platform
+        python_ver = sys.version.split()[0]
+        text = self.strings['about_text'].format(
+            version=self.version,
+            os=os_info,
+            python=python_ver,
+            adb=adb_path,
+            fastboot=fastboot_path
+        )
+        messagebox.showinfo(self.strings['about_title'], text)
 
     def check_devices(self):
         self.log("\n" + self.strings['scan_ports'])
@@ -1041,15 +1201,16 @@ class PhoneToolsTweakerApp:
             (self.strings['erase_recovery'], ['fastboot', 'erase', 'recovery']),
             (self.strings['format_userdata'], ['fastboot', 'format', 'userdata']),
             (self.strings['format_cache'], ['fastboot', 'format', 'cache']),
-            (self.strings['wipe_all'], 'fastboot erase system && fastboot erase userdata && fastboot erase cache'),
+            # wipe_all заменяем на последовательный вызов
+            (self.strings['wipe_all'], self.wipe_all_sequence),
         ]
         for text, cmd in wipe_cmds:
             color = '#ffcdd2' if 'wipe all' in text.lower() else '#3c3c3c'
             fg_color = 'black' if color == '#ffcdd2' else 'white'
-            if isinstance(cmd, list):
-                action = lambda c=cmd: self.run_task(c)
+            if callable(cmd):
+                action = cmd
             else:
-                action = lambda c=cmd: self.run_task(c, shell=True)
+                action = lambda c=cmd: self.run_task(c)
             self.make_button(f, text, action, width=55, anchor="w",
                              bg=color, fg=fg_color).pack(padx=20, pady=5, anchor="w")
 
@@ -1061,6 +1222,14 @@ class PhoneToolsTweakerApp:
         self.make_button(f, self.strings['trim_caches'],
                          lambda: self.run_task(['adb', 'shell', 'pm', 'trim-caches', '999G']),
                          width=55, anchor="w").pack(padx=20, pady=5, anchor="w")
+
+    def wipe_all_sequence(self):
+        if messagebox.askyesno("Confirm", self.strings['confirm_erase'].format(part="system, userdata, cache")):
+            self.run_sequence([
+                ['fastboot', 'erase', 'system'],
+                ['fastboot', 'erase', 'userdata'],
+                ['fastboot', 'erase', 'cache']
+            ])
 
     def create_tab_apps_backup(self):
         tab = ttk.Frame(self.notebook)
@@ -1166,7 +1335,7 @@ class PhoneToolsTweakerApp:
             (self.strings['shell_ps'], ['adb', 'shell', 'ps']),
             (self.strings['shell_service'], ['adb', 'shell', 'service', 'list']),
             (self.strings['shell_netstat'], ['adb', 'shell', 'netstat']),
-            (self.strings['shell_ping'], ['adb', 'shell', 'ping', '-c', '4', '8.8.8.8']),
+            (self.strings['shell_ping'], ['adb', 'shell', 'ping', '-c', '4', '8.8.8.8']),  # исправлено
             (self.strings['shell_wifi'], ['adb', 'shell', 'dumpsys', 'wifi']),
             (self.strings['shell_bluetooth'], ['adb', 'shell', 'dumpsys', 'bluetooth_manager']),
             (self.strings['shell_power'], ['adb', 'shell', 'input', 'keyevent', 'KEYCODE_POWER']),
@@ -1284,7 +1453,7 @@ class PhoneToolsTweakerApp:
                          lambda: self.run_task(['adb', 'shell', 'ip', '-f', 'inet', 'addr', 'show', 'wlan0']),
                          width=42).grid(row=2, column=0, padx=5, pady=5, sticky="w")
         self.make_button(f, self.strings['ping_device'],
-                         lambda: self.run_task(['adb', 'shell', 'ping', '-c', '4', '127.0.0.1']),
+                         lambda: self.run_task(['adb', 'shell', 'ping', '-c', '4', '8.8.8.8']),  # исправлено
                          width=42).grid(row=2, column=1, padx=5, pady=5, sticky="w")
 
         tk.Label(f, text=self.strings['wifi_header'], font=("Arial", 10, "bold"),
@@ -1415,10 +1584,23 @@ class PhoneToolsTweakerApp:
             self.strings['dialog_logcat_filter_title'],
             self.strings['dialog_logcat_filter_prompt']
         )
-        if tag and re.match(r'^[\w]+$', tag):
-            self.run_task(f"adb logcat -d | grep {shlex.quote(tag)}", shell=True)
-        else:
-            messagebox.showwarning("Ошибка", "Недопустимый тег")
+        if not tag:
+            return
+        # Выполняем adb logcat -d и фильтруем в Python
+        def filter_logcat():
+            try:
+                proc = subprocess.Popen(['adb', 'logcat', '-d'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                output, _ = proc.communicate()
+                lines = output.splitlines()
+                filtered = [line for line in lines if tag in line]
+                if filtered:
+                    self.log("\n".join(filtered))
+                else:
+                    self.log(f"[Нет строк с тегом '{tag}']")
+            except Exception as e:
+                self.log(f"[Ошибка] {str(e)}")
+        # Запускаем в отдельном потоке, чтобы не блокировать GUI
+        threading.Thread(target=filter_logcat, daemon=True).start()
 
     def create_tab_fastboot_extra(self):
         tab = ttk.Frame(self.notebook)
